@@ -6,11 +6,11 @@ import "C"
 import (
 	"bytes"
 	"context"
+	"embed"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -18,17 +18,16 @@ import (
 
 	"github.com/gen2brain/malgo"
 	"github.com/hraban/opus"
-	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
-	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
-	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
 )
 
 const captureSamples = 320
 const samplesPerFrame = 960
-const frameDuration = 20 * time.Millisecond
-const reorderDelay = 3 * frameDuration
+
+// XiaoZhi uplink: 60 ms of 16 kHz mono, three processed capture frames.
+const uplinkFrameSamples = 3 * captureSamples
+
+// The server sends speech in bursts; buffer up to 3 s of 20 ms blocks.
+const playbackBlocks = 150
 
 type captureFrame struct {
 	epoch, sequence uint64
@@ -48,13 +47,17 @@ type audio struct {
 	nativeContext *malgo.AllocatedContext
 	playback      chan playbackBlock
 	playbackDrops atomic.Uint64
-	stopping      atomic.Bool
-	current       playbackBlock
-	currentAt     int
+	heard         atomic.Int64
+	sentPackets   atomic.Int64
+	// Sum over sent packets of their mean absolute sample level.
+	sentLevel atomic.Int64
+	stopping  atomic.Bool
+	current   playbackBlock
+	currentAt int
 }
 
 func newAudio(epoch *stationEpoch) *audio {
-	return &audio{epoch: epoch, playback: make(chan playbackBlock, 12)}
+	return &audio{epoch: epoch, playback: make(chan playbackBlock, playbackBlocks)}
 }
 
 func (a *audio) open() error {
@@ -151,7 +154,8 @@ func (a *audio) callback(output, _ []byte, frames uint32) {
 	}
 }
 
-func (a *audio) send(ctx context.Context, track *webrtc.TrackLocalStaticSample, input <-chan captureFrame) error {
+// send encodes 60 ms Opus packets from processed capture; muted packets are read but not sent.
+func (a *audio) send(ctx context.Context, input <-chan captureFrame, muted func() bool, transmit func([]byte) error) error {
 	encoder, err := opus.NewEncoder(16000, 1, opus.AppVoIP)
 	if err != nil {
 		return fmt.Errorf("%w: cannot initialize Opus encoder", errStationAudio)
@@ -160,6 +164,9 @@ func (a *audio) send(ctx context.Context, track *webrtc.TrackLocalStaticSample, 
 		return fmt.Errorf("%w: cannot configure Opus encoder", errStationAudio)
 	}
 	var packet [4000]byte
+	var pcm [uplinkFrameSamples]int16
+	var gain uplinkGain
+	filled := 0
 	var expected uint64
 	haveFrame := false
 	for {
@@ -181,25 +188,106 @@ func (a *audio) send(ctx context.Context, track *webrtc.TrackLocalStaticSample, 
 		}
 		expected = frame.sequence + 1
 		haveFrame = true
-		n, err := encoder.Encode(frame.pcm[:], packet[:])
+		filled += copy(pcm[filled:], frame.pcm[:])
+		if filled < len(pcm) {
+			continue
+		}
+		filled = 0
+		if muted() {
+			continue
+		}
+		var level int64
+		for _, sample := range pcm {
+			level += max(int64(sample), -int64(sample))
+		}
+		a.sentPackets.Add(1)
+		a.sentLevel.Add(level / int64(len(pcm)))
+		dumpUplink(pcm[:])
+		gain.apply(pcm[:])
+		n, err := encoder.Encode(pcm[:], packet[:])
 		if err != nil {
 			return fmt.Errorf("%w: Opus capture encoding failed", errStationAudio)
 		}
 		if !a.epoch.allowed() {
 			return nil
 		}
-		if err := track.WriteSample(media.Sample{Data: packet[:n], Duration: frameDuration}); err != nil {
+		if err := transmit(packet[:n]); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return errors.New("audio transport send failed")
+			return errCallDropped
 		}
 	}
 }
 
+// The processed capture is tuned for the wake-word spotter and is far too quiet
+// for the assistant's speech detector, so the uplink is normalized.
+const (
+	uplinkTargetPeak = 12000.0
+	maxUplinkGain    = 30.0
+	// Per 60 ms packet: the envelope halves in about 1.4 s, the gain recovers in about 1 s.
+	envelopeRelease = 0.97
+	gainRecovery    = 0.06
+)
+
+// uplinkGain is an automatic gain control with instant attack and slow release.
+type uplinkGain struct {
+	envelope, gain float64
+}
+
+func (g *uplinkGain) apply(pcm []int16) {
+	var peak float64
+	for _, sample := range pcm {
+		peak = max(peak, math.Abs(float64(sample)))
+	}
+	g.envelope = max(peak, g.envelope*envelopeRelease)
+	target := min(maxUplinkGain, uplinkTargetPeak/max(g.envelope, 1))
+	if g.gain == 0 || target < g.gain {
+		g.gain = target
+	} else {
+		g.gain += (target - g.gain) * gainRecovery
+	}
+	for i, sample := range pcm {
+		pcm[i] = int16(max(math.MinInt16, min(math.MaxInt16, float64(sample)*g.gain)))
+	}
+}
+
+// decoder turns server Opus packets (any rate, mono) into 48 kHz stereo playback.
+type decoder struct {
+	opus *opus.Decoder
+	pcm  []int16
+}
+
+func newDecoder() (*decoder, error) {
+	d, err := opus.NewDecoder(48000, 2)
+	if err != nil {
+		return nil, errors.New("cannot initialize Opus decoder")
+	}
+	return &decoder{opus: d, pcm: make([]int16, 5760*2)}, nil
+}
+
+func (a *audio) play(d *decoder, packet []byte) error {
+	n, err := d.opus.Decode(packet, d.pcm)
+	if err != nil {
+		return errors.New("invalid server Opus packet")
+	}
+	a.queueDecoded(d.pcm[:n*2])
+	return nil
+}
+
+// Mean absolute sample level above which remote audio counts as speech.
+const audibleLevel = 300
+
 func (a *audio) queueDecoded(pcm []int16) {
 	if !a.epoch.allowed() {
 		return
+	}
+	var level int64
+	for _, sample := range pcm {
+		level += max(int64(sample), -int64(sample))
+	}
+	if len(pcm) > 0 && level/int64(len(pcm)) > audibleLevel {
+		a.heard.Store(time.Now().UnixNano())
 	}
 	for len(pcm) > 0 {
 		n := min(len(pcm), samplesPerFrame*2)
@@ -214,32 +302,90 @@ func (a *audio) queueDecoded(pcm []int16) {
 	}
 }
 
-func cuePCM(frequency float64) []int16 {
-	const frames = 48000 * 150 / 1000
-	const fade = 48000 * 10 / 1000
-	pcm := make([]int16, frames*2)
-	for i := range frames {
-		gain := 0.3 * min(1, float64(i)/fade, float64(frames-1-i)/fade)
-		sample := int16(gain * math.Sin(2*math.Pi*frequency*float64(i)/48000) * math.MaxInt16)
-		pcm[i*2], pcm[i*2+1] = sample, sample
-	}
-	return pcm
+// Call start and end sounds, decoded to raw S16LE 48 kHz stereo.
+//
+//go:embed cues/connected.pcm
+var connectedCue []byte
+
+//go:embed cues/hangup.pcm
+var hangupCue []byte
+
+// Russian ringback: 425 Hz, 0.8 s on, 3.2 s off.
+//
+//go:embed cues/ringback.pcm
+var ringbackCue []byte
+
+// Spoken failure reasons (Windows "Irina" voice).
+var (
+	//go:embed cues/error_connect.pcm
+	connectFailedCue []byte
+	//go:embed cues/error_dropped.pcm
+	callDroppedCue []byte
+	//go:embed cues/bind_intro.pcm
+	bindIntroCue []byte
+	//go:embed cues/bind_outro.pcm
+	bindOutroCue []byte
+	//go:embed cues/digits
+	digitCues embed.FS
+)
+
+const bytesPerSecond = 48000 * 2 * 2
+
+func playReadyCue(ctx context.Context) error {
+	return playCue(ctx, connectedCue)
 }
 
 func playEndCue(ctx context.Context) error {
-	return playCue(ctx, 440)
+	return playCue(ctx, hangupCue)
 }
 
-func playCue(parent context.Context, frequency float64) error {
-	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+// bindingSpeech reads the binding code aloud digit by digit, so a Station can be set up without a computer.
+func bindingSpeech(code string) []byte {
+	pause := make([]byte, bytesPerSecond/4)
+	speech := append(append([]byte{}, bindIntroCue...), pause...)
+	for _, digit := range code {
+		if cue, err := digitCues.ReadFile("cues/digits/" + string(digit) + ".pcm"); err == nil {
+			speech = append(append(speech, cue...), pause...)
+		}
+	}
+	return append(append(speech, pause...), bindOutroCue...)
+}
+
+// failureCue picks the spoken explanation for a failed voice call.
+func failureCue(err error) []byte {
+	var unbound activationError
+	switch {
+	case errors.As(err, &unbound):
+		return bindingSpeech(unbound.code)
+	case errors.Is(err, errConnectFailed):
+		return connectFailedCue
+	}
+	return callDroppedCue
+}
+
+type loopReader struct {
+	data []byte
+	at   int
+}
+
+func (r *loopReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data[r.at:])
+	r.at = (r.at + n) % len(r.data)
+	return n, nil
+}
+
+// playRingback repeats the ringback tone until ctx ends.
+func playRingback(ctx context.Context) {
+	cmd := exec.CommandContext(ctx, "/usr/bin/aplay", "-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2")
+	cmd.Stdin = &loopReader{data: ringbackCue}
+	_ = cmd.Run()
+}
+
+func playCue(parent context.Context, data []byte) error {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(len(data))*time.Second/bytesPerSecond+3*time.Second)
 	defer cancel()
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
-	}
-	pcm := cuePCM(frequency)
-	data := make([]byte, len(pcm)*2)
-	for i, sample := range pcm {
-		binary.LittleEndian.PutUint16(data[i*2:], uint16(sample))
 	}
 	cmd := exec.CommandContext(ctx, "/usr/bin/aplay", "-q", "-D", "default", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2")
 	cmd.Stdin = bytes.NewReader(data)
@@ -250,117 +396,4 @@ func playCue(parent context.Context, frequency float64) error {
 		return fmt.Errorf("cannot play voice cue: %w", err)
 	}
 	return nil
-}
-
-type paddingOpusDepacketizer struct {
-	codecs.OpusPacket
-}
-
-func (p *paddingOpusDepacketizer) Unmarshal(payload []byte) ([]byte, error) {
-	// Accept padding so a depacketizer error cannot skip buffered media during purge.
-	if len(payload) == 0 {
-		return nil, nil
-	}
-	return p.OpusPacket.Unmarshal(payload)
-}
-
-func (a *audio) receive(ctx context.Context, track *webrtc.TrackRemote) error {
-	codec := track.Codec()
-	if codec.MimeType != webrtc.MimeTypeOpus || codec.ClockRate != 48000 || codec.Channels != 2 {
-		return errors.New("unsupported remote audio codec")
-	}
-	decoder, err := opus.NewDecoder(48000, 2)
-	if err != nil {
-		return errors.New("cannot initialize Opus decoder")
-	}
-	pcm := make([]int16, 5760*2)
-	var lastReleased uint16
-	haveReleased := false
-	var nextTimestamp uint32
-	havePacket := false
-	arrivals := make(map[uint16]time.Time)
-	buffer := samplebuilder.New(3, &paddingOpusDepacketizer{}, 48000,
-		samplebuilder.WithMaxTimeDelay(reorderDelay),
-		samplebuilder.WithPacketReleaseHandler(func(packet *rtp.Packet) {
-			delete(arrivals, packet.SequenceNumber)
-			lastReleased = packet.SequenceNumber
-			haveReleased = true
-		}))
-	drain := func() error {
-		for sample := buffer.Pop(); sample != nil; sample = buffer.Pop() {
-			if len(sample.Data) == 0 {
-				continue
-			}
-			if havePacket {
-				gap := int32(sample.PacketTimestamp - nextTimestamp)
-				if gap > 0 && gap <= 3*samplesPerFrame && gap%samplesPerFrame == 0 {
-					for i := int32(0); i < gap; i += samplesPerFrame {
-						if decoder.DecodePLC(pcm[:samplesPerFrame*2:samplesPerFrame*2]) != nil {
-							return errors.New("Opus loss concealment failed")
-						}
-						a.queueDecoded(pcm[:samplesPerFrame*2])
-					}
-				} else if gap != 0 {
-					decoder, err = opus.NewDecoder(48000, 2)
-					if err != nil {
-						return errors.New("cannot replace Opus decoder after discontinuity")
-					}
-				}
-			}
-			n, err := decoder.Decode(sample.Data, pcm)
-			if err != nil {
-				return errors.New("invalid remote Opus packet")
-			}
-			nextTimestamp = sample.PacketTimestamp + uint32(n)
-			havePacket = true
-			a.queueDecoded(pcm[:n*2])
-		}
-		return nil
-	}
-	stop := context.AfterFunc(ctx, func() { _ = track.SetReadDeadline(time.Now()) })
-	defer stop()
-	for {
-		var deadline time.Time
-		for _, arrived := range arrivals {
-			if deadline.IsZero() || arrived.Add(reorderDelay).Before(deadline) {
-				deadline = arrived.Add(reorderDelay)
-			}
-		}
-		if !deadline.IsZero() && !time.Now().Before(deadline) {
-			buffer.Flush()
-			if err := drain(); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := track.SetReadDeadline(deadline); err != nil {
-			return errors.New("cannot set remote audio deadline")
-		}
-		if !a.epoch.allowed() || ctx.Err() != nil {
-			return nil
-		}
-		packet, _, err := track.ReadRTP()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			if timeout, ok := errors.AsType[net.Error](err); ok && timeout.Timeout() {
-				continue
-			}
-			return errors.New("remote audio stream ended")
-		}
-		if haveReleased && int16(packet.SequenceNumber-lastReleased) <= 0 {
-			continue
-		}
-		if len(packet.Payload) == 0 && !packet.Padding {
-			return errors.New("invalid remote Opus packet")
-		}
-		if _, pending := arrivals[packet.SequenceNumber]; !pending {
-			arrivals[packet.SequenceNumber] = time.Now()
-		}
-		buffer.Push(packet)
-		if err := drain(); err != nil {
-			return err
-		}
-	}
 }

@@ -8,12 +8,10 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -175,7 +173,7 @@ func TestStationRearmsAfterCallFailureAndWaitsForAlice(t *testing.T) {
 	go func() {
 		defer close(returned)
 		count := 0
-		done <- serveStation(ctx, client, credential{}, &output, func(e *stationEpoch, _ *stationGate, _ credential) error {
+		done <- serveStation(ctx, client, &output, func(e *stationEpoch, _ *stationGate) error {
 			count++
 			attempts <- e
 			if count == 1 {
@@ -237,127 +235,6 @@ func TestStationRearmsAfterCallFailureAndWaitsForAlice(t *testing.T) {
 	}
 }
 
-func TestStationRearmsAfterSessionRejectionWithoutRetry(t *testing.T) {
-	for _, cancellation := range []string{"none", "Alice", "parent", "joined Alice", "joined parent"} {
-		for _, status := range []int{400, 422, 200} {
-			t.Run(fmt.Sprintf("%d/%s", status, cancellation), func(t *testing.T) {
-				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-				defer cancel()
-				var requests atomic.Int32
-				httpClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-					requests.Add(1)
-					body := "private-rejection-body"
-					if status == 200 {
-						body = "v=0\r\ns=offline\r\n"
-					}
-					return &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewBufferString(body)), Header: make(http.Header), Request: req}, nil
-				})}
-				var controlFailure error
-				var controlPeer *peer
-				if status == 200 {
-					a, b := localPeer(t, ctx), localPeer(t, ctx)
-					connectLocalPeers(t, ctx, a, b)
-					if err := b.dc.SendText(`{"type":"error","message":"private-rejection-body"}`); err != nil {
-						t.Fatal(err)
-					}
-					select {
-					case <-a.ctx.Done():
-					case <-ctx.Done():
-						t.Fatal("DC rejection was not received")
-					}
-					if err := b.close(); err != nil {
-						t.Fatal(err)
-					}
-					controlPeer = a
-					controlFailure = a.outcome(errRemoteClosed)
-					if controlFailure == nil {
-						t.Fatal("received rejection became normal closure")
-					}
-				}
-				client, server := net.Pipe()
-				defer server.Close()
-				armed := make(chan struct{}, 2)
-				wake := make(chan struct{}, 1)
-				rejected := make(chan struct{})
-				done := make(chan error, 1)
-				var output bytes.Buffer
-				go func() {
-					done <- serveStation(ctx, client, credential{AccessToken: "synthetic-token", DeviceID: "offline-device"}, &output, func(e *stationEpoch, gate *stationGate, auth credential) error {
-						armed <- struct{}{}
-						select {
-						case <-e.ctx.Done():
-							return context.Cause(e.ctx)
-						case <-wake:
-						}
-						_, err := exchangeOffer(e.ctx, httpClient, auth, "v=0\r\n", []byte(`{}`))
-						if err == nil {
-							err = controlFailure
-						}
-						if strings.Contains(cancellation, "Alice") {
-							gate.observe(nativeEvent{activation: true})
-						} else if strings.Contains(cancellation, "parent") {
-							cancel()
-						}
-						if strings.HasPrefix(cancellation, "joined") {
-							if controlPeer != nil {
-								err = controlPeer.outcome(context.Cause(e.ctx))
-							} else {
-								err = errors.Join(context.Cause(e.ctx), err)
-							}
-						}
-						close(rejected)
-						return voiceCallError{err}
-					}, func(context.Context) error {
-						t.Error("rejected session produced a completion cue")
-						return nil
-					})
-				}()
-				if _, err := server.Write(framedIPC(3, wireInt(nil, 1, 0))); err != nil {
-					t.Fatal(err)
-				}
-				select {
-				case <-armed:
-				case <-ctx.Done():
-					t.Fatal("station did not arm")
-				}
-				wake <- struct{}{}
-				select {
-				case <-rejected:
-				case <-time.After(time.Second):
-					t.Fatal("session rejection did not complete")
-				}
-				if strings.Contains(cancellation, "Alice") {
-					select {
-					case <-armed:
-						t.Fatal("station rearmed while Alice had priority")
-					case <-time.After(20 * time.Millisecond):
-					}
-					if _, err := server.Write(framedIPC(3, wireInt(nil, 1, 0))); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if !strings.Contains(cancellation, "parent") {
-					select {
-					case <-armed:
-					case <-ctx.Done():
-						t.Fatal("rejected call did not rearm under IDLE")
-					}
-				}
-				if requests.Load() != 1 {
-					t.Fatal("detection rearm made a new signaling request")
-				}
-				cancel()
-				if err := <-done; err != context.Canceled {
-					t.Fatal("successful cleanup did not preserve bare cancellation", err)
-				}
-				if !bytes.Contains(output.Bytes(), []byte("Voice attempt failed")) || bytes.Contains(output.Bytes(), []byte("private")) || bytes.Contains(output.Bytes(), []byte("ended normally")) {
-					t.Fatal("rejection was hidden, classified as success, or disclosed", output.String())
-				}
-			})
-		}
-	}
-}
-
 func TestStationExpectedCancellationIsQuiet(t *testing.T) {
 	for _, parentCanceled := range []bool{false, true} {
 		t.Run(fmt.Sprint(parentCanceled), func(t *testing.T) {
@@ -369,10 +246,10 @@ func TestStationExpectedCancellationIsQuiet(t *testing.T) {
 			done := make(chan error, 1)
 			var output bytes.Buffer
 			go func() {
-				done <- serveStation(ctx, client, credential{}, &output, func(e *stationEpoch, _ *stationGate, _ credential) error {
+				done <- serveStation(ctx, client, &output, func(e *stationEpoch, _ *stationGate) error {
 					armed <- e
 					<-e.ctx.Done()
-					return runCall(e, credential{AccessToken: "synthetic-token", DeviceID: "offline-device"}, newStationCapture(e), sessionSettings{})
+					return runCall(e, &xiaozhiDirectory{identity: xiaozhiIdentity{DeviceID: "test-device", ClientID: "test-client"}}, newStationCapture(e))
 				}, func(context.Context) error {
 					t.Error("canceled attempt produced a completion cue")
 					return nil
@@ -432,7 +309,7 @@ func TestStationCleanupSurvivesAliceAndParentCancellation(t *testing.T) {
 				done := make(chan error, 1)
 				attempts := 0
 				go func() {
-					done <- serveStation(ctx, client, credential{}, io.Discard, func(e *stationEpoch, gate *stationGate, _ credential) error {
+					done <- serveStation(ctx, client, io.Discard, func(e *stationEpoch, gate *stationGate) error {
 						attempts++
 						if parentCanceled {
 							cancel()
@@ -476,7 +353,7 @@ func TestCompletionCueDiagnostic(t *testing.T) {
 			var output bytes.Buffer
 			go func() {
 				attempts := 0
-				done <- serveStation(ctx, client, credential{}, &output, func(e *stationEpoch, _ *stationGate, _ credential) error {
+				done <- serveStation(ctx, client, &output, func(e *stationEpoch, _ *stationGate) error {
 					attempts++
 					if attempts == 1 {
 						return nil
@@ -512,7 +389,7 @@ func TestStationNativeAudioFaultIsTerminal(t *testing.T) {
 	defer server.Close()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveStation(ctx, client, credential{}, io.Discard, func(*stationEpoch, *stationGate, credential) error {
+		done <- serveStation(ctx, client, io.Discard, func(*stationEpoch, *stationGate) error {
 			return voiceCallError{fmt.Errorf("%w: capture stalled", errStationAudio)}
 		}, func(context.Context) error {
 			t.Error("native audio failure produced a completion cue")
@@ -552,7 +429,7 @@ func TestStationAliceTakeoverCleanupFaultIsTerminal(t *testing.T) {
 	go func() {
 		defer close(returned)
 		var got result
-		got.err = serveStation(ctx, client, credential{}, io.Discard, func(e *stationEpoch, gate *stationGate, _ credential) error {
+		got.err = serveStation(ctx, client, io.Discard, func(e *stationEpoch, gate *stationGate) error {
 			got.attempts++
 			if got.attempts > 1 {
 				return errors.New("unexpected retry after native audio cleanup failure")
@@ -650,7 +527,7 @@ func TestStationCompletionYieldsToAliceAndRearms(t *testing.T) {
 	go func() {
 		defer close(returned)
 		count := 0
-		done <- serveStation(ctx, client, credential{}, io.Discard, func(e *stationEpoch, _ *stationGate, _ credential) error {
+		done <- serveStation(ctx, client, io.Discard, func(e *stationEpoch, _ *stationGate) error {
 			count++
 			attempts <- e
 			if count == 1 {

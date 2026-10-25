@@ -7,10 +7,11 @@ import (
 	"os/signal"
 	"syscall"
 
-	"yandex-station-chatgpt-voice/internal/voice"
+	"station-xiaozhi/internal/voice"
 )
 
 func main() {
+	exitWithParent()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := voice.Run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil && err != context.Canceled {

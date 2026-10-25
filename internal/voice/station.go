@@ -14,7 +14,7 @@ import (
 
 const detectorQueueFrames = 40
 const captureQueueFrames = 600
-const setupTimeout = 8 * time.Second
+const setupTimeout = 15 * time.Second
 
 var errAlicePriority = errors.New("native Alice has priority")
 var errCleanup = errors.New("resource cleanup failed")
@@ -223,11 +223,14 @@ func (c *stationCapture) pushPCM(pcm []byte) error {
 	return nil
 }
 
-func runStation(parent context.Context, credentialFile string, settings sessionSettings, out io.Writer) error {
-	auth, err := loadCredential(credentialFile)
+func runStation(parent context.Context, out io.Writer) error {
+	identity, err := loadIdentity(identityPath())
 	if err != nil {
 		return err
 	}
+	directory := &xiaozhiDirectory{identity: identity}
+	// Warm the OTA cache so the first call does not wait for it.
+	go func() { _, _ = directory.lookup(parent, log.New(out, "", log.Ltime|log.Lmicroseconds)) }()
 	conn, err := dialStation(parent, "127.0.0.1:9875")
 	if err != nil {
 		if parent.Err() != nil {
@@ -235,16 +238,16 @@ func runStation(parent context.Context, credentialFile string, settings sessionS
 		}
 		return errors.New("cannot connect to native Alice state")
 	}
-	return serveStation(parent, conn, auth, out, func(e *stationEpoch, gate *stationGate, auth credential) error {
-		return runStationEpoch(e, gate, auth, settings)
+	return serveStation(parent, conn, out, func(e *stationEpoch, gate *stationGate) error {
+		return runStationEpoch(e, gate, directory)
 	}, playEndCue)
 }
 
-func serveStation(parent context.Context, conn net.Conn, auth credential, out io.Writer, attempt func(*stationEpoch, *stationGate, credential) error, endCue func(context.Context) error) error {
+func serveStation(parent context.Context, conn net.Conn, out io.Writer, attempt func(*stationEpoch, *stationGate) error, endCue func(context.Context) error) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	gate := newStationGate()
-	report := log.New(out, "", 0)
+	report := log.New(out, "", log.Ltime|log.Lmicroseconds)
 	defer report.Print("Station voice stopped.")
 	stateDone := make(chan error, 1)
 	var stateWorker sync.WaitGroup
@@ -263,7 +266,7 @@ func serveStation(parent context.Context, conn net.Conn, auth credential, out io
 		}
 		if epoch := gate.begin(ctx); epoch != nil {
 			epoch.report = report
-			err := attempt(epoch, gate, auth)
+			err := attempt(epoch, gate)
 			var cue *stationEpoch
 			if err == nil {
 				cue = gate.completion(ctx, epoch)
@@ -295,6 +298,8 @@ func serveStation(parent context.Context, conn net.Conn, auth credential, out io
 				report.Print("Voice yielded to native Alice.")
 			} else if err == nil {
 				report.Print("Voice call ended normally.")
+			} else if !callFailed {
+				report.Print("Voice call ended: ", err)
 			}
 			continue
 		}
@@ -311,7 +316,7 @@ func serveStation(parent context.Context, conn net.Conn, auth credential, out io
 	}
 }
 
-func runStationEpoch(e *stationEpoch, gate *stationGate, auth credential, settings sessionSettings) (result error) {
+func runStationEpoch(e *stationEpoch, gate *stationGate, directory *xiaozhiDirectory) (result error) {
 	detector, err := newNativeSpotter()
 	if err != nil {
 		return err
@@ -367,9 +372,16 @@ func runStationEpoch(e *stationEpoch, gate *stationGate, auth credential, settin
 				return err
 			}
 			e.report.Print("Yandex wake confirmed; connecting voice.")
-			err = runCall(e, auth, capture, settings)
+			err = runCall(e, directory, capture)
 			if cause := context.Cause(e.ctx); errors.Is(cause, errStationAudio) && !errors.Is(err, errStationAudio) {
 				return errors.Join(cause, err)
+			}
+			if _, failed := errors.AsType[voiceCallError](err); failed {
+				// The failed epoch is already revoked; speak the reason in a fresh one Alice can still preempt.
+				if cue := gate.completion(context.WithoutCancel(e.ctx), e); cue != nil {
+					_ = playCue(cue.ctx, failureCue(err))
+					_ = gate.finish(cue, nil)
+				}
 			}
 			return err
 		}

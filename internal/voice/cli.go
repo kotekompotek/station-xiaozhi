@@ -3,203 +3,95 @@ package voice
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
-
-	"golang.org/x/sys/unix"
-	"golang.org/x/term"
+	"time"
 )
 
-const help = `yandex-station-chatgpt-voice: Station ChatGPT website Voice
+const help = `station-xiaozhi ` + Version + `: voice assistant for Yandex Station (XiaoZhi)
 
 Usage:
-  yandex-station-chatgpt-voice run [--voice=NAME] [--backend-model=NAME] [--backend-thinking-effort=VALUE]
-  yandex-station-chatgpt-voice auth import [--session-json FILE]
-  yandex-station-chatgpt-voice help
+  station-xiaozhi run        start the assistant (normally done by the installer)
+  station-xiaozhi bind       show the binding code and wait until it is entered at xiaozhi.me
+  station-xiaozhi version
+  station-xiaozhi help
 
-Import your own ChatGPT web access token at the hidden prompt, or select one
-session JSON file containing accessToken. The Station starts GPT on Яндекс
-only while native Alice explicitly reports IDLE. Алиса stays native.
+Say "Яндекс" to talk to the assistant; "Алиса" stays native and always has priority.
 `
 
-func Run(ctx context.Context, args []string, in *os.File, out, errOut io.Writer) error {
+// bindPoll is how often bind asks the server whether the code was entered.
+const bindPoll = 5 * time.Second
+
+const bindTimeout = 10 * time.Minute
+
+// bindRepeat is how often the Station reads the binding code aloud while waiting.
+const bindRepeat = 45 * time.Second
+
+func Run(ctx context.Context, args []string, _ *os.File, out, _ io.Writer) error {
 	if len(args) == 0 {
-		return runStation(ctx, credentialPath(), sessionSettings{}, out)
+		return runStation(ctx, out)
+	}
+	if len(args) > 1 {
+		return fmt.Errorf("%s does not accept arguments", args[0])
 	}
 	switch args[0] {
 	case "help", "-h", "--help":
 		_, err := io.WriteString(out, help)
 		return err
-	case "auth":
-		if len(args) < 2 || args[1] != "import" {
-			return errors.New("usage: yandex-station-chatgpt-voice auth import [--session-json FILE]")
-		}
-		flags := flag.NewFlagSet("auth import", flag.ContinueOnError)
-		flags.SetOutput(errOut)
-		input := flags.String("session-json", "", "explicit session JSON file containing accessToken")
-		if err := flags.Parse(args[2:]); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				return nil
-			}
-			return errors.New("invalid auth import options")
-		}
-		if flags.NArg() != 0 {
-			return errors.New("credentials are never accepted as arguments")
-		}
-		path := credentialPath()
-		var c credential
-		if *input != "" {
-			f, err := os.Open(*input)
-			if err != nil {
-				return errors.New("cannot open the selected session JSON file")
-			}
-			c, err = readSession(f)
-			f.Close()
-			if err != nil {
-				return err
-			}
-		} else {
-			token, err := readHiddenToken(ctx, in, errOut)
-			if err != nil {
-				return err
-			}
-			c.AccessToken = string(token)
-			clear(token)
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := importCredential(path, c); err != nil {
-			return err
-		}
-		_, err := fmt.Fprintln(out, "Session imported into your private configuration directory.")
+	case "version", "--version":
+		_, err := fmt.Fprintln(out, Version)
 		return err
 	case "run":
-		settings, err := parseRunSettings(args[1:])
-		if errors.Is(err, flag.ErrHelp) {
-			_, err = io.WriteString(out, help)
-			return err
-		}
-		if err != nil {
-			return err
-		}
-		return runStation(ctx, credentialPath(), settings, out)
+		return runStation(ctx, out)
+	case "bind":
+		return runBind(ctx, out)
 	default:
-		return errors.New("unknown command; run yandex-station-chatgpt-voice help")
+		return errors.New("unknown command; run station-xiaozhi help")
 	}
 }
 
-func parseRunSettings(args []string) (sessionSettings, error) {
-	var settings sessionSettings
-	flags := flag.NewFlagSet("run", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	flags.StringVar(&settings.Voice, "voice", "", "voice name")
-	flags.StringVar(&settings.BackendModel, "backend-model", "", "backend model name")
-	flags.StringVar(&settings.BackendThinkingEffort, "backend-thinking-effort", "", "thinking effort or disabled")
-	if err := flags.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return sessionSettings{}, flag.ErrHelp
-		}
-		return sessionSettings{}, errors.New("invalid run options; see help")
-	}
-	if flags.NArg() != 0 {
-		return sessionSettings{}, errors.New("run does not accept positional arguments")
-	}
-	return settings, nil
-}
-
-func readAvailable(ctx context.Context, in *os.File, buf []byte) (int, error) {
-	for ctx.Err() == nil {
-		fd := int(in.Fd())
-		if fd < 0 {
-			return 0, os.ErrClosed
-		}
-		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-		n, err := unix.Poll(fds, 100)
-		if errors.Is(err, unix.EINTR) {
-			continue
-		}
-		if err != nil {
-			return 0, err
-		}
-		if n == 0 {
-			continue
-		}
-		count, err := unix.Read(fd, buf)
-		if errors.Is(err, unix.EINTR) {
-			continue
-		}
-		if err != nil {
-			return 0, err
-		}
-		if count == 0 {
-			return 0, io.EOF
-		}
-		return count, nil
-	}
-	return 0, ctx.Err()
-}
-
-func readHiddenToken(ctx context.Context, in *os.File, out io.Writer) ([]byte, error) {
-	fd := int(in.Fd())
-	if !term.IsTerminal(fd) {
-		return nil, errors.New("hidden import requires a terminal; use auth import --session-json FILE for an explicit file")
-	}
-	state, err := term.MakeRaw(fd)
+// runBind waits until this Station is bound to an account at xiaozhi.me.
+func runBind(ctx context.Context, out io.Writer) error {
+	identity, err := loadIdentity(identityPath())
 	if err != nil {
-		return nil, errors.New("cannot hide terminal input")
+		return err
 	}
-	return readHiddenInput(ctx, in, out, func() error { return term.Restore(fd, state) })
-}
-
-func readHiddenInput(ctx context.Context, in *os.File, out io.Writer, restore func() error) (token []byte, result error) {
-	defer func() {
-		if restore() != nil {
-			result = errors.Join(result, errors.New("cannot restore terminal input"))
-		}
-		if _, err := fmt.Fprint(out, "\r\n"); err != nil {
-			result = errors.Join(result, errors.New("cannot finish hidden token prompt"))
-		}
-		if result != nil {
-			clear(token)
-			token = nil
-		}
-	}()
-	if _, err := fmt.Fprint(out, "ChatGPT web access token (hidden): "); err != nil {
-		return nil, errors.New("cannot write hidden token prompt")
-	}
-	value := make([]byte, 0, 4096)
-	var b [1]byte
+	// adb may leave this running on the Station after the computer gives up waiting.
+	ctx, cancel := context.WithTimeoutCause(ctx, bindTimeout,
+		errors.New("код не введён за 10 минут; станция продиктует его снова, если сказать «Яндекс»"))
+	defer cancel()
+	shown, offline := "", false
+	var spoken time.Time
 	for {
-		if _, err := readAvailable(ctx, in, b[:]); err != nil {
-			clear(value)
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
+		server, err := fetchServer(ctx, identity)
+		switch {
+		case ctx.Err() != nil:
+			return context.Cause(ctx)
+		case err != nil:
+			if !offline {
+				fmt.Fprintln(out, "Нет связи с сервером XiaoZhi, повторяю...", err)
 			}
-			if errors.Is(err, io.EOF) {
-				return nil, context.Canceled
-			}
-			return nil, errors.New("cannot read hidden token input")
+			offline = true
+		case server.ActivationCode == "":
+			fmt.Fprintln(out, "Станция привязана к xiaozhi.me.")
+			return nil
+		case server.ActivationCode != shown:
+			shown, offline = server.ActivationCode, false
+			fmt.Fprintf(out, "\n  Код привязки: %s\n\n"+
+				"Откройте https://xiaozhi.me, войдите, нажмите «Add Device» и введите этот код.\n"+
+				"Станция продиктует его вслух. Жду привязки "+
+				"(Ctrl+C — продолжить позже: код можно будет снова услышать, сказав станции «Яндекс»)...\n", shown)
+			spoken = time.Time{}
 		}
-		switch b[0] {
-		case 3, 4:
-			clear(value)
-			return nil, context.Canceled
-		case '\r', '\n':
-			return value, nil
-		case 127, 8:
-			if len(value) > 0 {
-				value[len(value)-1] = 0
-				value = value[:len(value)-1]
-			}
-		default:
-			if len(value) >= 32768 {
-				clear(value)
-				return nil, errors.New("access token is too long")
-			}
-			value = append(value, b[0])
+		if shown != "" && !offline && time.Since(spoken) >= bindRepeat {
+			_ = playCue(ctx, bindingSpeech(shown))
+			spoken = time.Now()
+		}
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-time.After(bindPoll):
 		}
 	}
 }

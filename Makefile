@@ -6,43 +6,39 @@ UV ?= uv
 PYTHON ?= python3
 ADB ?= adb
 STATION_IP ?=
-SESSION_JSON ?=
 JOBS ?= 2
 
 -include config.mk
-export GO UV PYTHON JOBS MAKE
+export GO UV PYTHON JOBS MAKE ADB ZIG EXTRA_PATH
 
-start restart: export VOICE := $(VOICE)
-start restart: export BACKEND_MODEL := $(BACKEND_MODEL)
-start restart: export BACKEND_THINKING_EFFORT := $(BACKEND_THINKING_EFFORT)
-auth: export SESSION_JSON := $(SESSION_JSON)
+VERSION := $(shell sed -n 's/^const Version = "\(.*\)"/\1/p' internal/voice/paths.go)
+RELEASE := dist/station-xiaozhi-$(VERSION)
 
-.PHONY: help setup fmt test vet check build clean connect status install start stop restart logs shell auth
+.PHONY: help setup fmt test vet check build clean release install status start stop bind uninstall logs shell
 
 help:
 	@printf '%s\n' \
-	  'setup    Prepare Go modules, pinned Zig and ARM Opus (no system packages)' \
-	  'fmt      Format Go source in place' \
-	  'test     Run native race tests (requires host Opus, pkg-config and cc)' \
-	  'vet      Vet native source (requires host Opus, pkg-config and cc)' \
-	  'check    Check formatting, helpers, tests and vet without formatting writes' \
-	  'build    Build ARM build/yandex-station-chatgpt-voice' \
-	  'clean    Remove build output; retain config, credentials and toolchain cache' \
-	  'connect  Connect ADB to STATION_IP:5555' \
-	  'status   Inspect root, install, process and session permissions' \
-	  'install  Build, verify, stop the old client and install; leave stopped' \
-	  'start    Start the installed client' \
-	  'stop     Stop only the verified client process' \
-	  'restart  Stop and start the installed client' \
-	  'logs     Follow /tmp/yandex-station-chatgpt-voice.log' \
-	  'shell    Open the selected Station shell' \
-	  'auth     Import with a hidden prompt, or SESSION_JSON=/path/to/file' \
+	  'setup      Prepare Go modules, pinned Zig and ARM Opus (no system packages)' \
+	  'fmt        Format Go source in place' \
+	  'test       Run native race tests (requires host Opus, pkg-config and cc)' \
+	  'vet        Vet native source (requires host Opus, pkg-config and cc)' \
+	  'check      Check formatting, scripts, tests and vet without formatting writes' \
+	  'build      Build ARM build/station-xiaozhi' \
+	  'release    Build dist/station-xiaozhi-$(VERSION)/, its .zip and the yam .yap' \
+	  'install    Release, then install on STATION_IP with the bundled installer' \
+	  'status     Show whether the assistant runs, and its recent log' \
+	  'start      Start and enable autostart' \
+	  'stop       Stop and disable autostart' \
+	  'bind       Show the xiaozhi.me binding code and wait for it' \
+	  'uninstall  Remove the assistant from the Station' \
+	  'logs       Follow the Station log' \
+	  'shell      Open the Station shell' \
+	  'clean      Remove build and dist output; keep config and toolchain cache' \
 	  '' \
-	  'Copy config.example.mk to config.mk and set STATION_IP before device commands.' \
-	  'Use make install restart to install and explicitly activate.'
+	  'Copy config.example.mk to config.mk and set STATION_IP before device commands.'
 
 setup:
-	$(GO) list -mod=readonly -tags=nolibopusfile -deps ./cmd/yandex-station-chatgpt-voice >/dev/null
+	$(GO) list -mod=readonly -tags=nolibopusfile -deps ./cmd/station-xiaozhi >/dev/null
 	sh tools/build-arm.sh setup
 
 fmt:
@@ -64,18 +60,30 @@ vet:
 check:
 	@files="$$("$$($(GO) env GOROOT)/bin/gofmt" -l cmd internal)"; test -z "$$files" || { printf 'Run make fmt for:\n%s\n' "$$files" >&2; exit 1; }
 	sh -n tools/build-arm.sh
-	$(PYTHON) -c 'import ast; from pathlib import Path; [ast.parse(p.read_text(), filename=str(p)) for p in Path("tools").glob("*.py")]'
+	for f in package/install.sh package/station/*.sh package/station/S99station-xiaozhi; do sh -n "$$f" || exit 1; done
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s tools -p 'test_*.py'
 	$(MAKE) test vet
 
 build:
 	sh tools/build-arm.sh build
 
+release: build
+	$(PYTHON) tools/release.py
+
 clean:
-	rm -rf build
+	rm -rf build dist
 
-connect status start stop restart logs shell auth:
-	$(PYTHON) tools/station.py --adb "$(ADB)" --ip "$(STATION_IP)" $@
+install: release
+	sh $(RELEASE)/install.sh "$(STATION_IP)"
 
-install: build
-	$(PYTHON) tools/station.py --adb "$(ADB)" --ip "$(STATION_IP)" install
+status start stop bind:
+	sh $(RELEASE)/install.sh "$(STATION_IP)" $@
+
+uninstall:
+	sh $(RELEASE)/install.sh "$(STATION_IP)" --uninstall
+
+logs:
+	MSYS_NO_PATHCONV=1 $(ADB) -s "$(STATION_IP):5555" shell tail -n 100 -f /data/station-xiaozhi/client.log
+
+shell:
+	$(ADB) -s "$(STATION_IP):5555" shell

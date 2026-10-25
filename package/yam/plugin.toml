@@ -1,0 +1,12 @@
+id = "station-xiaozhi"
+name = "Ассистент XiaoZhi"
+version = "@VERSION@"
+entry = "run.sh"
+description = "Голосовой ассистент XiaoZhi по слову «Яндекс»; Алиса остаётся. Код привязки станция продиктует сама."
+permissions = ["exec"]
+
+[launch]
+kind = "binary"
+mode = "service"
+path = "run.sh"
+interpreter = "sh"

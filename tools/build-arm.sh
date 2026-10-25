@@ -13,6 +13,10 @@ UV=${UV:-uv}
 PYTHON=${PYTHON:-python3}
 JOBS=${JOBS:-2}
 MAKE=${MAKE:-make}
+# Optional: a local Zig 0.17.0 executable instead of the uv-managed one (e.g. on Windows),
+# and directories to put first on PATH (e.g. a POSIX sh without spaces in its path for make).
+ZIG=${ZIG:-}
+[ -z "${EXTRA_PATH:-}" ] || export PATH="$EXTRA_PATH:$PATH"
 case "${1:-}" in setup | build) action=$1 ;; *)
 	echo 'Usage: sh tools/build-arm.sh setup|build' >&2
 	exit 2
@@ -27,7 +31,9 @@ esac
 	echo 'JOBS must be from 1 to 32.' >&2
 	exit 2
 }
-for tool in "$GO" "$UV" "$PYTHON" "$MAKE" pkg-config curl tar; do
+zig_tool=$UV
+[ -z "$ZIG" ] || zig_tool=$ZIG
+for tool in "$GO" "$zig_tool" "$PYTHON" "$MAKE" pkg-config curl tar; do
 	command -v "$tool" >/dev/null || {
 		echo "Required command missing: $tool" >&2
 		exit 1
@@ -48,17 +54,22 @@ trap 'exit 143' TERM
 for compiler in cc ar ranlib; do
 	wrapper="$PWD/.cache/arm-$compiler"
 	case "$compiler" in cc) flags=' -target arm-linux-gnueabihf.2.30 -mcpu=cortex_a7' ;; *) flags= ;; esac
-	printf '#!/bin/sh\nexec "${UV:-uv}" tool run --from ziglang==0.17.0 python-zig %s%s "$@"\n' "$compiler" "$flags" >"$wrapper"
+	if [ -n "$ZIG" ]; then
+		printf '#!/bin/sh\nexec "%s" %s%s "$@"\n' "$ZIG" "$compiler" "$flags" >"$wrapper"
+	else
+		printf '#!/bin/sh\nexec "${UV:-uv}" tool run --from ziglang==0.17.0 python-zig %s%s "$@"\n' "$compiler" "$flags" >"$wrapper"
+	fi
 	chmod 755 "$wrapper"
 done
 export UV
-[ "$("$UV" tool run --from ziglang==0.17.0 python-zig version)" = 0.17.0 ] || {
+if [ -n "$ZIG" ]; then zig_version=$("$ZIG" version); else zig_version=$("$UV" tool run --from ziglang==0.17.0 python-zig version); fi
+[ "$zig_version" = 0.17.0 ] || {
 	echo 'Unexpected Zig version.' >&2
 	exit 1
 }
 
 # The absolute prefix is embedded in opus.pc; a moved cache must be rebuilt.
-key="zig=0.17.0 target=arm-linux-gnueabihf.2.30 cpu=cortex_a7 opus=$sha static,no-extra,no-doc,no-intrinsics,no-rtcd,no-asm prefix=$prefix"
+key="zig=0.17.0${ZIG:+-local} target=arm-linux-gnueabihf.2.30 cpu=cortex_a7 opus=$sha static,no-extra,no-doc,no-intrinsics,no-rtcd,no-asm prefix=$prefix"
 if [ ! -f "$prefix/.build-key" ] || [ "$(cat "$prefix/.build-key")" != "$key" ] ||
 	[ ! -f "$prefix/lib/libopus.a" ] || [ ! -f "$prefix/include/opus/opus.h" ] || [ ! -f "$prefix/lib/pkgconfig/opus.pc" ]; then
 	if [ ! -f "$archive" ]; then
@@ -88,12 +99,25 @@ export PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" PKG_CONFIG_PATH= PKG_CONFIG_SYS
 }
 if [ "$action" = build ]; then
 	mkdir -p build
-	output=$(mktemp "$PWD/build/.yandex-station-chatgpt-voice.XXXXXX")
-	CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC="$PWD/.cache/arm-cc" \
-		CGO_CFLAGS="$(pkg-config --cflags opus)" CGO_LDFLAGS="$(pkg-config --static --libs opus)" \
+	output=$(mktemp "$PWD/build/.station-xiaozhi.XXXXXX")
+	# Go on Windows cannot execute the shell-script wrapper, so a local Zig is called directly.
+	cc="$PWD/.cache/arm-cc"
+	[ -z "$ZIG" ] || cc="$ZIG cc -target arm-linux-gnueabihf.2.30 -mcpu=cortex_a7"
+	# CGO_CFLAGS replaces Go's default -O2 -g, so restore optimization explicitly. The prefix maps
+	# keep the builder's directories out of C file names embedded in the binary (in every spelling
+	# a Windows build produces).
+	cflags="-O2 -g0"
+	for dir in "$("$GO" env GOMODCACHE)" "$PWD" "$(pwd -W 2>/dev/null || true)" ${ZIG:+"$(dirname "$ZIG")"}; do
+		[ -n "$dir" ] || continue
+		for spelling in "$dir" "$(printf '%s' "$dir" | tr '\\' /)" "$(printf '%s' "$dir" | tr / '\\')"; do
+			cflags="$cflags -ffile-prefix-map=$spelling=/build"
+		done
+	done
+	CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 CC="$cc" \
+		CGO_CFLAGS="$cflags $(pkg-config --cflags opus)" CGO_LDFLAGS="$(pkg-config --static --libs opus)" \
 		"$GO" build -mod=readonly -tags=nolibopusfile -trimpath -buildvcs=false \
-		-ldflags='-s -w' -o "$output" ./cmd/yandex-station-chatgpt-voice
-	mv -f "$output" build/yandex-station-chatgpt-voice
+		-ldflags='-s -w' -o "$output" ./cmd/station-xiaozhi
+	mv -f "$output" build/station-xiaozhi
 	output=
-	printf '%s\n' 'Built build/yandex-station-chatgpt-voice for Linux ARMv7.'
+	printf '%s\n' 'Built build/station-xiaozhi for Linux ARMv7.'
 fi

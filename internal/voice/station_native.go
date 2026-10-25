@@ -36,7 +36,7 @@ func modelOverlay(stock string) (directory string, result error) {
 		}
 		text = strings.ReplaceAll(text, old, flag+" false")
 	}
-	directory, err = os.MkdirTemp("", "chatgpt-yandex-*")
+	directory, err = os.MkdirTemp("", "station-xiaozhi-*")
 	if err != nil {
 		return "", errors.New("cannot create private Yandex model overlay")
 	}

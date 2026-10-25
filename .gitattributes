@@ -1,0 +1,9 @@
+* text=auto
+*.sh text eol=lf
+package/station/* text eol=lf
+*.go text eol=lf
+Makefile text eol=lf
+*.mk text eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.pcm binary

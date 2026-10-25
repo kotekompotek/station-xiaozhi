@@ -1,0 +1,17 @@
+#!/bin/sh
+# Starts station-xiaozhi at boot. Inert unless the installer enabled it, and after a
+# factory reset (which wipes /data), so the Station behaves as stock.
+app=/data/station-xiaozhi
+
+case "$1" in
+start)
+    [ -f "$app/enabled" ] && [ -x "$app/station-xiaozhi" ] && [ -f "$app/run.sh" ] || exit 0
+    setsid sh "$app/run.sh" < /dev/null > /dev/null 2>&1 &
+    ;;
+stop)
+    ;;
+*)
+    echo "Usage: $0 {start|stop}"
+    exit 1
+esac
+exit 0
